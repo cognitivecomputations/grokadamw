@@ -11,7 +11,6 @@
 6. [Common Pitfalls and Debugging Tips](#common-pitfalls-and-debugging-tips)
 7. [Contribution](#contribution)
 8. [License](#license)
-9. [Additional Resources](#additional-resources)
 
 ## Overview
 
