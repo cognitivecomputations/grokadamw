@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 class GrokAdamW(Optimizer):
     def __init__(self, params: Iterable[torch.Tensor], lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999),
                  eps: float = 1e-8, weight_decay: float = 1e-2, alpha_init: float = 0.98, lamb: float = 2.0,
-                 gamma: float = 0.1, grokking_signal_fn: Optional[Callable[[], float]] = None,
-                 grokking_signal_decay_rate: float = 0.1):
+                 gamma: float = 0.1, grokking_signal_fns: Optional[list[Callable[[], float]]] = None,
+                 grokking_signal_decay_rate: float = 0.1, gradient_clipping: float = 1.0):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -28,8 +28,9 @@ class GrokAdamW(Optimizer):
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                         alpha_init=alpha_init, lamb=lamb, gamma=gamma,
-                        grokking_signal_fn=grokking_signal_fn,
-                        grokking_signal_decay_rate=grokking_signal_decay_rate)
+                        grokking_signal_fns=grokking_signal_fns,
+                        grokking_signal_decay_rate=grokking_signal_decay_rate,
+                        gradient_clipping=gradient_clipping)
         super(GrokAdamW, self).__init__(params, defaults)
 
         # Pre-allocate state tensors and move to CUDA if available
@@ -72,13 +73,7 @@ class GrokAdamW(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            grokking_signal = None
-            if group['grokking_signal_fn'] is not None:
-                try:
-                    grokking_signal = group['grokking_signal_fn']()
-                except Exception as e:
-                    logger.warning(f"Error in grokking_signal_fn: {e}. Using default signal value.")
-                    grokking_signal = None
+            grokking_signal = self._compute_grokking_signal(group)
 
             params_with_grad = [p for p in group['params'] if p.grad is not None]
             if not params_with_grad:
@@ -98,6 +93,26 @@ class GrokAdamW(Optimizer):
 
         return loss
 
+    def _compute_grokking_signal(self, group: dict) -> Optional[float]:
+        """Computes a combined grokking signal from multiple functions."""
+        if group['grokking_signal_fns'] is None:
+            return None
+
+        signals = []
+        for fn in group['grokking_signal_fns']:
+            try:
+                signal = fn()
+                if signal is not None:
+                    signals.append(signal)
+            except Exception as e:
+                logger.warning(f"Error in grokking_signal_fn: {e}. Ignoring this function.")
+        
+        if not signals:
+            return None
+
+        # Example: Taking the mean of all valid signals
+        return sum(signals) / len(signals)
+
     @staticmethod
     def _update_group(group: dict, params: list[torch.Tensor], grads: list[torch.Tensor], 
                       grokking_signal: Optional[float]) -> None:
@@ -107,6 +122,10 @@ class GrokAdamW(Optimizer):
             beta1, beta2 = group['betas']
 
             state['step'] += 1
+
+            # Apply gradient clipping if enabled
+            if group['gradient_clipping'] > 0:
+                torch.nn.utils.clip_grad_norm_(p, group['gradient_clipping'])
 
             # Layer-wise momentum decay
             layer_beta1 = beta1 * (1 - group['gamma'])**i
