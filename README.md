@@ -2,16 +2,29 @@
 
 **GrokAdamW** is a novel optimizer designed to enhance AI training by combining the strengths of Grokfast (a technique for accelerating "grokking" in deep learning models) with the robustness and efficiency of the AdamW optimizer. It's particularly useful for models exhibiting delayed generalization, where performance on validation data improves significantly after a period of overfitting to the training data.
 
-### Theory:
+## Table of Contents
+1. [Overview](#overview)
+2. [Theory](#theory)
+3. [Mathematical Explanation](#mathematical-explanation)
+4. [Usage](#usage)
+5. [Configuration](#configuration)
+6. [Common Pitfalls and Debugging Tips](#common-pitfalls-and-debugging-tips)
+7. [Contribution](#contribution)
+8. [License](#license)
+9. [Additional Resources](#additional-resources)
 
-**Grokking** is a phenomenon where deep learning models achieve sudden generalization after a long period of overfitting. Research suggests that this delayed generalization is related to the slow-varying components of gradients during training.  **Grokfast**, inspired by this research, accelerates grokking by amplifying these slow-varying gradients.
+## Overview
+
+**Grokking** is a phenomenon where deep learning models achieve sudden generalization after a long period of overfitting. Research suggests that this delayed generalization is related to the slow-varying components of gradients during training. **Grokfast**, inspired by this research, accelerates grokking by amplifying these slow-varying gradients.
 
 **GrokAdamW** builds upon this concept by integrating Grokfast's adaptive frequency amplification into the AdamW optimization algorithm. It introduces several key innovations:
 
 1. **Adaptive Momentum:** The momentum of the Grokfast component (which controls the emphasis on slow-varying gradients) dynamically adjusts based on a "Grokking Signal" that reflects the model's generalization progress.
 2. **Layer-Wise Momentum Decay:** Recognizing that different layers learn at different rates, GrokAdamW implements a gradual decay of the AdamW momentum parameter (β1) from earlier to later layers, promoting faster generalization in early layers while preventing overfitting in later layers.
-3. **Multiple Grokking Signals:**  Allows for flexibility in defining the Grokking Signal by supporting multiple signal functions, which can be combined to capture different aspects of generalization performance. 
-4. **Optional Gradient Clipping:** Provides the option to clip gradients, enhancing training stability and preventing exploding gradients, a common issue in deep learning. 
+3. **Multiple Grokking Signals:** Allows for flexibility in defining the Grokking Signal by supporting multiple signal functions, which can be combined to capture different aspects of generalization performance.
+4. **Optional Gradient Clipping:** Provides the option to clip gradients, enhancing training stability and preventing exploding gradients, a common issue in deep learning.
+
+## Theory:
 
 ### Mathematical Explanation:
 
@@ -45,7 +58,7 @@ For each layer *l*, parameter *p*, and training step *t*:
 * If `gradient_clipping` > 0:
    * `torch.nn.utils.clip_grad_norm_(parameters, gradient_clipping)` 
 
-### Usage:
+## Usage:
 
 ```python
 import torch
@@ -72,7 +85,7 @@ for epoch in range(num_epochs):
     loss = optimizer.step(closure=lambda: your_loss_function(model, data)) 
 ```
 
-**Configuration:**
+## Configuration:
 
 GrokAdamW supports standard AdamW parameters (`lr`, `betas`, `eps`, `weight_decay`) and additional parameters for Grokfast:
 
@@ -83,12 +96,25 @@ GrokAdamW supports standard AdamW parameters (`lr`, `betas`, `eps`, `weight_deca
 * `grokking_signal_decay_rate`: Decay rate for adjusting alpha based on the grokking signal (default: 0.1)
 * `gradient_clipping`: Maximum norm for gradient clipping (default: 1.0, set to 0 to disable)
 
-**Key Points:**
+## Common Pitfalls and Debugging Tips
 
-* Define your `grokking_signal_fn(s)` to capture the difference between training and validation performance, or other metrics relevant to generalization.
-* Carefully tune the Grokfast-specific hyperparameters (`alpha_init`, `lamb`, `gamma`) to achieve optimal performance for your model and task.
-* Monitor the Grokking Signal, alpha values, and gradient clipping during training to understand the optimizer's behavior and make adjustments as needed. 
+1. **Grokking Signal Functions Not Providing Useful Signals:** 
+   - Ensure that the functions return meaningful values, reflecting aspects like validation vs. training loss differences.
+   - Consider normalizing the output of signal functions.
 
-**Contribution:**
+2. **Issues with Gradient Clipping:**
+   - If gradients are frequently being clipped, it may indicate a need to adjust the learning rate or other hyperparameters.
 
-GrokAdamW is an ongoing research project. Your feedback and contributions are welcome!
+3. **Unexpected Behavior with Layer-wise Momentum Decay:**
+   - Monitor the learning dynamics for different layers. If some layers are learning too slowly or too quickly, adjust `gamma` or individual layer hyperparameters accordingly.
+
+4. **Monitoring Grokking Signal and Alpha Values:**
+   - Use tools like TensorBoard or custom logging to track the grokking signal, alpha values, and gradient norms. This can help in understanding the optimizer's behavior and making necessary adjustments.
+
+## Contribution
+
+GrokAdamW is an ongoing research project. Your feedback and contributions are welcome! Please feel free to submit issues, feature requests, or pull requests. For more details, see our [CONTRIBUTING.md](CONTRIBUTING.md) file.
+
+## License
+
+GrokAdamW is licensed under the MIT License. See the LICENSE file for more details.
