@@ -47,14 +47,6 @@ For each layer *l*, parameter *p*, and training step *t*:
 
 ### Usage:
 
-**1. Installation:**
-
-```bash
-pip install grokadamw  # Assuming you've packaged it 
-```
-
-**2. Example:**
-
 ```python
 import torch
 import torch.nn as nn
