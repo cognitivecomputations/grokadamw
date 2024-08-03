@@ -68,8 +68,10 @@ from grokadamw import GrokAdamW
 model = nn.Linear(10, 1)
 
 # Define your grokking signal function(s)
-def grokking_signal_fn():
-    return (val_loss - train_loss) / train_loss
+def grokking_signal_fn(training_loss: float, validation_loss: float) -> float:
+    if training_loss == 0:
+        return 0.0  # Avoid division by zero
+    return (validation_loss - training_loss) / training_loss
 
 # Initialize GrokAdamW optimizer
 optimizer = GrokAdamW(model.parameters(), lr=1e-3, grokking_signal_fn=grokking_signal_fn)
