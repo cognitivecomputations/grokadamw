@@ -2,6 +2,24 @@
 
 **GrokAdamW** is a novel optimizer designed to enhance AI training by combining the strengths of Grokfast (a technique for accelerating "grokking" in deep learning models) with the robustness and efficiency of the AdamW optimizer. It's particularly useful for models exhibiting delayed generalization, where performance on validation data improves significantly after a period of overfitting to the training data.
 
+This implementation was inspired by the following papers:
+
+- **Grokfast: Accelerated Grokking by Amplifying Slow Gradients**  
+  Lee, J., Kang, B. G., Kim, K., & Lee, K. M. (2024).  
+  *arXiv:2405.20233 [cs.LG]*.  
+  [https://doi.org/10.48550/arXiv.2405.20233](https://doi.org/10.48550/arXiv.2405.20233)
+
+- **Grokking: Generalization Beyond Overfitting on Small Algorithmic Datasets**  
+  Power, A., Burda, Y., Edwards, H., Babuschkin, I., & Misra, V. (2022).  
+  *arXiv:2201.02177 [cs.LG]*.  
+  [https://doi.org/10.48550/arXiv.2201.02177](https://doi.org/10.48550/arXiv.2201.02177)
+
+- **Decoupled Weight Decay Regularization**  
+  Loshchilov, I., & Hutter, F. (2019).  
+  *arXiv:1711.05101 [cs.LG]*.  
+  [https://doi.org/10.48550/arXiv.1711.05101](https://doi.org/10.48550/arXiv.1711.05101)
+
+
 ## Table of Contents
 1. [Overview](#overview)
 2. [Theory](#theory)
