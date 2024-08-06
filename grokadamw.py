@@ -93,10 +93,22 @@ class GrokAdamW(Optimizer):
 
         return loss
 
+    @staticmethod
+    def _default_grokking_signal(train_loss: Optional[float], eval_loss: Optional[float]) -> float:
+        """Default grokking signal function based on loss difference."""
+        if train_loss is None or eval_loss is None:  
+            return 0.0 
+        diff = max(0, eval_loss - train_loss) 
+        max_loss = max(eval_loss, train_loss) 
+        return diff / max_loss if max_loss > 0 else 0.0
+
     def _compute_grokking_signal(self, group: dict) -> Optional[float]:
         """Computes a combined grokking signal from multiple functions."""
         if group['grokking_signal_fns'] is None:
-            return None
+            # Calculate default grokking signal if no functions are provided
+            train_loss = group.get('train_loss', None) 
+            eval_loss = group.get('eval_loss', None)
+            return self._default_grokking_signal(train_loss, eval_loss)
 
         signals = []
         for fn in group['grokking_signal_fns']:
