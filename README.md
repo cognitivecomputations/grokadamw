@@ -28,11 +28,12 @@ This implementation was inspired by the following papers:
 1. [Overview](#overview)
 2. [Theory](#theory)
 3. [Mathematical Explanation](#mathematical-explanation)
-4. [Usage](#usage)
-5. [Configuration](#configuration)
-6. [Common Pitfalls and Debugging Tips](#common-pitfalls-and-debugging-tips)
-7. [Contribution](#contribution)
-8. [License](#license)
+4. [Installation](#installation)
+5. [Usage](#usage)
+6. [Configuration](#configuration)
+7. [Common Pitfalls and Debugging Tips](#common-pitfalls-and-debugging-tips)
+8. [Contribution](#contribution)
+9. [License](#license)
 
 ## Overview
 
@@ -78,6 +79,14 @@ For each layer *l*, parameter *p*, and training step *t*:
 
 * If `gradient_clipping` > 0:
    * `torch.nn.utils.clip_grad_norm_(parameters, gradient_clipping)` 
+
+## Installation
+
+You can easily install GrokAdamW using pip:
+
+```bash
+pip install grokadamw
+```
 
 ## Usage:
 
