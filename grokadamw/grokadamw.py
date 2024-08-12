@@ -33,40 +33,12 @@ class GrokAdamW(Optimizer):
                         gradient_clipping=gradient_clipping)
         super(GrokAdamW, self).__init__(params, defaults)
 
-        # Pre-allocate state tensors and move to CUDA if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for group in self.param_groups:
-            for p in group['params']:
-                state = self.state[p] = {}
-                state['step'] = 0
-                state['exp_avg'] = torch.empty_like(p, memory_format=torch.preserve_format).to(device)
-                state['exp_avg_sq'] = torch.empty_like(p, memory_format=torch.preserve_format).to(device)
-                state['grok_ema'] = torch.empty_like(p, memory_format=torch.preserve_format).to(device)
-                
-                # Initialize tensors
-                state['exp_avg'].zero_()
-                state['exp_avg_sq'].zero_()
-                state['grok_ema'].zero_()
-
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        return self._step_impl(closure, use_amp=False)
+        return self._step_impl(closure)
 
-    @torch.no_grad()
-    def step_amp(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        return self._step_impl(closure, use_amp=True)
-
-    def _step_impl(self, closure: Optional[Callable[[], float]], use_amp: bool) -> Optional[float]:
-        """Performs a single optimization step.
-
-        Args:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-            use_amp (bool): Whether to use automatic mixed precision (AMP).
-
-        Returns:
-            Optional[float]: The loss value returned by the closure, if provided.
-        """
+    def _step_impl(self, closure: Optional[Callable[[], float]]) -> Optional[float]:
+        """Performs a single optimization step."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -81,32 +53,23 @@ class GrokAdamW(Optimizer):
 
             grads = [p.grad for p in params_with_grad]
 
-            # Function to apply parameter updates
-            def _apply_updates(): 
-                self._update_group(group, params_with_grad, grads, grokking_signal)
-
-            if use_amp:
-                with autocast():
-                    _apply_updates()
-            else:
-                _apply_updates()
+            self._update_group(group, params_with_grad, grads, grokking_signal)
 
         return loss
 
     @staticmethod
     def _default_grokking_signal(train_loss: Optional[float], eval_loss: Optional[float]) -> float:
         """Default grokking signal function based on loss difference."""
-        if train_loss is None or eval_loss is None:  
-            return 0.0 
-        diff = max(0, eval_loss - train_loss) 
-        max_loss = max(eval_loss, train_loss) 
+        if train_loss is None or eval_loss is None:
+            return 0.0
+        diff = max(0, eval_loss - train_loss)
+        max_loss = max(eval_loss, train_loss)
         return diff / max_loss if max_loss > 0 else 0.0
 
     def _compute_grokking_signal(self, group: dict) -> Optional[float]:
         """Computes a combined grokking signal from multiple functions."""
         if group['grokking_signal_fns'] is None:
-            # Calculate default grokking signal if no functions are provided
-            train_loss = group.get('train_loss', None) 
+            train_loss = group.get('train_loss', None)
             eval_loss = group.get('eval_loss', None)
             return self._default_grokking_signal(train_loss, eval_loss)
 
@@ -119,53 +82,72 @@ class GrokAdamW(Optimizer):
             except Exception as e:
                 logger.warning(f"Error in grokking_signal_fn: {e}. Ignoring this function.")
         
-        if not signals:
-            return None
-
-        # Example: Taking the mean of all valid signals
-        return sum(signals) / len(signals)
+        return sum(signals) / len(signals) if signals else None
 
     @staticmethod
     def _update_group(group: dict, params: list[torch.Tensor], grads: list[torch.Tensor], 
                       grokking_signal: Optional[float]) -> None:
         for i, (p, grad) in enumerate(zip(params, grads)):
-            state = group['state'][p]
-            exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+            state = group.get('state', {}).get(p, {})
+            if not state:
+                state = {'step': 0, 'exp_avg': torch.zeros_like(p, device='cpu'), 
+                         'exp_avg_sq': torch.zeros_like(p, device='cpu'), 
+                         'grok_ema': torch.zeros_like(p, device='cpu')}
+                if 'state' not in group:
+                    group['state'] = {}
+                group['state'][p] = state
+            
+            exp_avg, exp_avg_sq = state['exp_avg'].to(p.device), state['exp_avg_sq'].to(p.device)
+            grok_ema = state['grok_ema'].to(p.device)
             beta1, beta2 = group['betas']
 
             state['step'] += 1
 
-            # Apply gradient clipping if enabled
             if group['gradient_clipping'] > 0:
                 torch.nn.utils.clip_grad_norm_(p, group['gradient_clipping'])
 
-            # Layer-wise momentum decay
-            layer_beta1 = beta1 * (1 - group['gamma'])**i
+            with autocast():
+                layer_beta1 = beta1 * (1 - group['gamma'])**i
 
-            # Grokfast component
-            grok_grad = GrokAdamW._update_grok_ema(grad, state, group, grokking_signal)
+                # Update grok_ema
+                alpha = group['alpha_init']
+                if grokking_signal is not None:
+                    alpha = alpha * math.exp(-group['grokking_signal_decay_rate'] * grokking_signal)
+                grok_ema.mul_(alpha).add_(grad, alpha=1 - alpha)
+                grok_grad = grad + group['lamb'] * grok_ema
 
-            # AdamW update with Grokfast-amplified gradient
-            exp_avg.mul_(layer_beta1).add_(grok_grad, alpha=1 - layer_beta1)
-            exp_avg_sq.mul_(beta2).addcmul_(grok_grad, grok_grad, value=1 - beta2)
+                # Update moments
+                exp_avg.mul_(layer_beta1).add_(grok_grad, alpha=1 - layer_beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grok_grad, grok_grad, value=1 - beta2)
 
-            # AdamW bias correction
-            bias_correction1 = 1 - beta1 ** state['step']
-            bias_correction2 = 1 - beta2 ** state['step']
-            step_size = group['lr'] * torch.sqrt(bias_correction2) / bias_correction1
+                # Bias correction
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
-            # Decoupled weight decay (from AdamW)
-            p.mul_(1 - group['lr'] * group['weight_decay'])
+                # Update parameters
+                p.mul_(1 - group['lr'] * group['weight_decay'])
+                p.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(group['eps']), value=-step_size)
 
-            # Update parameters
-            p.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(group['eps']), value=-step_size)
+            # Move states back to CPU
+            state['exp_avg'] = exp_avg.to('cpu')
+            state['exp_avg_sq'] = exp_avg_sq.to('cpu')
+            state['grok_ema'] = grok_ema.to('cpu')
 
-    @staticmethod
-    def _update_grok_ema(grad: torch.Tensor, state: dict, group: dict, 
-                         grokking_signal: Optional[float]) -> torch.Tensor:
-        grok_ema = state['grok_ema']
-        alpha = group['alpha_init']
-        if grokking_signal is not None:
-            alpha = alpha * torch.exp(-group['grokking_signal_decay_rate'] * grokking_signal)
-        grok_ema.mul_(alpha).add_(grad, alpha=1 - alpha)
-        return grad + group['lamb'] * grok_ema
+    def state_dict(self):
+        state_dict = super().state_dict()
+        for group in state_dict['param_groups']:
+            group['grokking_signal_fns'] = None  # Cannot serialize functions
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            group['grokking_signal_fns'] = self.defaults['grokking_signal_fns']
+
+    def __setstate__(self, state: dict) -> None:
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('grokking_signal_fns', [])
+            group.setdefault('grokking_signal_decay_rate', 0.1)
+            group.setdefault('gradient_clipping', 1.0)
