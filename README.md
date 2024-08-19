@@ -2,6 +2,8 @@
 
 by Eric Hartford
 
+![image](https://github.com/user-attachments/assets/fb99dab8-9d0f-4b15-a777-1261ec01d908)
+
 **GrokAdamW** is a novel optimizer designed to enhance AI training by combining the strengths of Grokfast (a technique for accelerating "grokking" in deep learning models) with the robustness and efficiency of the AdamW optimizer. It's particularly useful for models exhibiting delayed generalization, where performance on validation data improves significantly after a period of overfitting to the training data.
 
 **Update:** This optimizer was used to train the awesome tiny model [nisten/Biggie-SmoLlm-0.15B-Base](https://huggingface.co/nisten/Biggie-SmoLlm-0.15B-Base)
