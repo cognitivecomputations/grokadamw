@@ -27,21 +27,22 @@
 | O11 | _foreach_copy_ (3→2 launches) | Launch | — | Minor | Trivial | **DONE** |
 | O13 | Vectorize scaling loop | Launch | — | Minor | Trivial | **DONE** |
 | O16 | Hoist bias_correction | Algorithmic | — | Minor | Trivial | **DONE** |
-| O2 | Eliminate grok_grad_buf (fallback path) | Memory | 25% state | — | Medium | REMAINING |
+| O2 | Eliminate grok_grad_buf (fallback path) | Memory | 25% state | — | Medium | **DONE** |
 | O3 | bfloat16 state storage | Memory | 50% state | — | Medium | REMAINING |
 | O4 | 8-bit quantized states | Memory | 75% state | — | Very High | REMAINING |
 | O5 | Pair launch (cache locality) | Compute | — | 5-10% | Low | **DONE** |
-| O6 | Reduce atomic_add contention | Compute | — | Var. | Medium | REMAINING |
-| O8 | @triton.autotune | Compute | — | 5-15% | Low | REMAINING |
-| O9 | Async pinned CPU transfers | Data Movement | — | 20-40% | Low-Med | REMAINING |
+| O6 | Reduce atomic_add contention | Compute | — | Var. | Medium | **REVERTED** |
+| O8 | @triton.autotune | Compute | — | 5-15% | Low | **DONE** |
+| O9 | Async pinned CPU transfers | Data Movement | — | 20-40% offload | Low-Med | **REVERTED** |
 | O10 | Pre-allocate grad fp32 buffer | Data Movement | Minor | Minor | Low | **DONE** |
 | O12 | Vectorize moment update loop | Launch | — | Significant | Low | BLOCKED |
 | O14 | CUDA Graphs (persistent norms_buf) | Launch | — | 2-5x | Low | **DONE** |
 | O15 | Flat-param batching | Launch | Minor | 30-50% | Very High | REMAINING |
+| — | GradPower (grad_power param) | Algorithmic | — | — | Low | **REJECTED** |
 
 ---
 
-## DONE: Changes Applied (9 total)
+## DONE: Changes Applied (11 total)
 
 ### 1. BUG FIX: Contiguity check in `grokadamw_fused_group`
 
@@ -74,6 +75,35 @@
 | Large ~10M | 465.7 MB | 433.7 MB | 32.0 MB |
 
 Savings scale linearly with parameter count: ~4 bytes per parameter removed (1x fp32 tensor).
+
+---
+
+### 2b. O2: Eliminate `grok_grad_buf` from fallback path
+
+**File:** `grokadamw.py:34-53`
+
+**Problem:** `grok_grad_buf` was allocated for all fallback-path parameters. The buffer was zeroed and refilled every step — effectively a temporary. Storing it as persistent state wastes memory.
+
+**Fix:** Removed `grok_grad_buf` entirely. Computed `grok_grad` inline in `_foreach_update`:
+```python
+for i in range(n):
+    grok_grad = grads[i] + lamb * grok_emas[i]
+    grok_grad_norm = grok_grad.norm()
+    scale = grad_norms[i] / grok_grad_norm.clamp(min=eps)
+    grok_grad = grok_grad * scale
+```
+
+`grok_grad` is a local tensor — computed, used, discarded each step. No persistent buffer.
+
+**Key tradeoff:** Loses batched `_foreach_norm(grok_grad_bufs)` — norms computed per-param instead. Acceptable because the fallback path is already slower than Triton.
+
+**Memory savings (cpu_offload, Llama 36.96M):**
+
+| Metric | Pre-O2 | Post-O2 | Savings |
+|---|---|---|---|
+| CPU state memory | 564 MB | 423 MB | **141 MB** |
+
+VRAM unchanged for GPU-only path (grok_grad_buf was never allocated for Triton params after O1).
 
 ---
 
@@ -298,6 +328,107 @@ Kernel code unchanged. Only launch order changed.
 
 ---
 
+### 10. O8: @triton.autotune
+
+**File:** `_triton_fused.py:14-108`
+
+**Problem:** Static heuristics `bs = min(4096, triton.next_power_of_2(n))` with hardcoded `num_warps`/`num_stages` for all GPU architectures. Optimal BLOCK_SIZE varies: RTX 5060 Ti (Ada) prefers BS=1024 for norms on large tensors, while old heuristic always used BS=4096.
+
+**Fix:** Replaced manual heuristics with `@triton.autotune` decorator on both `_norms_kernel` and `_update_kernel`:
+
+- 7 configs: BLOCK_SIZE ∈ {512, 1024, 2048, 4096, 8192} with varying num_warps/num_stages
+- `key=["n_elements"]` — autotune per param size, cached across same-size params
+- `_norms_kernel`: `reset_to_zero=["out_grad_sq_ptr", "out_grok_sq_ptr"]` + `restore_value=["grok_ema_ptr"]`
+- `_update_kernel`: `restore_value=["p_ptr", "exp_avg_ptr", "exp_avg_sq_ptr"]`
+- Launch functions simplified: `grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)`
+
+**Critical bug found and fixed:** Without `restore_value=["grok_ema_ptr"]` on `_norms_kernel`, autotune corrupted grok_ema during benchmarking (each config wrote to grok_ema, next config read corrupted value). This caused 1e-3 numerical divergence on first step.
+
+**Autotune results (RTX 5060 Ti):**
+
+| Param size | _norms_kernel best | _update_kernel best |
+|---|---|---|
+| 32.7M (embedding) | BS=1024, nw=4, ns=2 | BS=8192, nw=8, ns=3 |
+| 262K (weight) | BS=4096, nw=8, ns=3 | BS=4096, nw=8, ns=3 |
+| 65K (bias-like) | BS=512, nw=4, ns=2 | BS=512, nw=4, ns=2 |
+| 256 (bias) | BS=4096, nw=8, ns=2 | BS=512, nw=4, ns=2 |
+
+**Warmup cost:** ~7.5s for 5 unique param sizes × 7 configs × 2 kernels. Only first run; cached in-process.
+
+**train_real.py Results (Llama 36.96M, 1000 steps):**
+
+| Metric | Pre-O8 | Post-O8 | Change |
+|---|---|---|---|
+| opt_ms (steady) | 4.6–5.0 ms | 4.9–5.4 ms | Within noise |
+| opt_ms (step 100) | 5.0 ms | 72.9 ms (warmup) | One-time cost |
+
+**Notes:**
+- Steady-state timing within GPU variance — autotune benefit is architecture-specific
+- On different GPUs (A100, H100) the selected configs may differ significantly
+- Warmup cost is amortized over training: 7.5s / 1000 steps = negligible
+- The real value is **portability** — same code auto-optimizes for any GPU
+
+---
+
+### 11. O6: atomic_add Contention Reduction — REVERTED
+
+**File:** `_triton_fused.py` (reverted), `grokadamw.py` (reverted)
+
+**Problem:** `_norms_kernel` uses `tl.atomic_add` to two scalar addresses. For large params (16M elements, BLOCK_SIZE=4096 → 4096 blocks), 4096 atomic operations serialize on 2 addresses.
+
+**Fix attempted:** Per-block workspace buffer — each block writes its partial sum to its own slot (`workspace[pid]`), then CPU-side `workspace[:max_blocks].sum()` reduces. This eliminates all atomic contention.
+
+**Implementation:**
+- `_norms_kernel`: Changed `tl.atomic_add(out_ptr, val)` → `tl.store(workspace_ptr + pid, val)` (per-block, no serialization)
+- `_launch_norms`: Added `workspace.zero_()`, kernel launch, then `norms_buf[0] = workspace[:max_blocks].sum()`
+- `grokadamw.py`: Added `norms_workspace` (persistent, shape `[max_blocks * 2]`) to optimizer state
+- `state_dict`/`load_state_dict`: Excluded + migrated `norms_workspace`
+
+**train_real.py Results (Llama 36.96M, 1000 steps):**
+
+| Metric | Pre-O6 | Post-O6 | Change |
+|---|---|---|---|
+| opt_ms (steady) | 4.9–5.3 ms | 7.6–8.5 ms | **~55% REGRESSION** |
+| total_ms | 183–185 ms | 185–187 ms | ~1-2% slower |
+| VRAM | 13547 MB | 13548 MB | +1 MB (workspace) |
+
+**Why it regressed:**
+- Per-block workspace adds 3 extra kernel launches per param: `workspace.zero_()`, `workspace[:max_blocks].sum()`, `workspace[max_blocks:].sum()`
+- 28 params × 3 = 84 extra kernel launches ≈ 3ms overhead
+- RTX 5060 Ti has fast L2 atomics — the atomic_add contention was NOT the bottleneck on this GPU
+- The workspace approach helps GPUs with slow atomics (older architectures) but hurts modern GPUs with fast atomics
+
+**Verdict:** Reverted. O6 may help on specific hardware (e.g., older GPUs with slow atomics, or extremely large params >100M elements), but the per-param overhead of workspace zero + CPU-side sum negates the benefit on modern GPUs.
+
+---
+
+### 12. O9: Async CPU↔GPU Transfers (pin_memory + non_blocking) — REVERTED
+
+**File:** `grokadamw.py` (reverted)
+
+**Problem:** `cpu_offload=True` path uses synchronous `.to(p.device)` for every state transfer. Each call blocks until the DMA transfer completes, stalling the GPU.
+
+**Fix attempted:**
+1. Pinned memory at state init: CPU state tensors allocated with `.pin_memory()`
+2. Non-blocking transfers: All `.to()` calls use `non_blocking=True`
+3. `load_state_dict` migration: Tensors pinned after being moved to CPU
+
+**train_real.py Results (Llama 36.96M, cpu_offload, 1000 steps):**
+
+| Metric | Pre-O9 (sync) | Post-O9 (pin+nb) | Change |
+|---|---|---|---|
+| VRAM | 13547 MB | 13618 MB | **+71 MB REGRESSION** |
+| opt_ms (cpu_offload) | ~185 ms | ~185 ms | No change |
+
+**Why it regressed:**
+- `pin_memory()` reserves DMA staging buffers in GPU VRAM, adding ~71MB for a 37M param model
+- The non_blocking flag didn't improve opt_ms because the serial nature of the optimizer step (CPU→GPU for each param, compute, GPU→CPU) leaves no opportunity for overlap
+- PCIe bandwidth (~12 GB/s) is the fundamental bottleneck, not transfer latency
+
+**Verdict:** Reverted. pin_memory helps with DataLoader-style async prefetching, not with serial CPU↔GPU transfer patterns in optimizer state management.
+
+---
+
 ## BLOCKED: O12 — Vectorize moment update loop
 
 **File:** `grokadamw.py:49-56`
@@ -314,15 +445,9 @@ Kernel code unchanged. Only launch order changed.
 
 ---
 
-## REMAINING: 10 Optimizations Not Yet Implemented
+## REMAINING: 3 Optimizations Not Yet Implemented
 
 ### ANGLE 1: MEMORY FOOTPRINT
-
-#### O2: Eliminate `grok_grad_buf` from fallback path
-- **What:** `grok_grad_buf` is zeroed every step anyway (line 42). Compute `grok_grad` inline in the per-param loop instead of using a persistent buffer.
-- **Savings:** Same 25% of state VRAM, but for ALL execution paths (not just Triton).
-- **Tradeoff:** Loses `_foreach_norm(grok_grad_bufs)` batched norm computation. Must compute per-param norms individually.
-- **Complexity:** Medium — restructure `_foreach_update` to avoid the buffer entirely.
 
 #### O3: bfloat16 state storage
 - **What:** Store `exp_avg`, `exp_avg_sq`, `grok_ema` as bfloat16 instead of float32.
@@ -335,48 +460,82 @@ Kernel code unchanged. Only launch order changed.
 - **Savings:** 75% state VRAM (3×fp32 → 3×int8).
 - **Complexity:** Very high — needs quantization/dequantization kernels.
 
-### ANGLE 2: COMPUTE EFFICIENCY
-
-#### O6: Reduce atomic_add contention in `_norms_kernel`
-- **What:** For a 4096×4096 weight matrix, BLOCK_SIZE=4096 produces 4096 blocks all doing `tl.atomic_add` to the same 2 scalar addresses (`_triton_fused.py:39-40`). Serializes 4096 atomic operations per address.
-- **Fix:** Write partial sums to per-block slots in a workspace buffer, then reduce in a second pass or on CPU.
-- **Complexity:** Medium.
-- **Impact:** Significant for large params (>1M elements). Negligible for small params.
-
-#### O8: `@triton.autotune` for both kernels
-- **What:** Current heuristics are static (`_triton_fused.py:90,122-123`). GPU occupancy depends on architecture (Ampere vs Hopper).
-- **Complexity:** Low.
-- **Impact:** 5-15% kernel speedup, architecture-dependent.
-
-### ANGLE 3: DATA MOVEMENT
-
-#### O9: Async CPU↔GPU transfers for `cpu_offload`
-- **What:** `grokadamw.py:207-210` uses synchronous `.to(p.device)`. Blocks GPU.
-- **Fix:** `pin_memory=True` at state init + `non_blocking=True` for transfers + double-buffering (transfer param[i+1] states while computing param[i]).
-- **Complexity:** Low-medium.
-- **Impact:** 20-40% for cpu_offload path.
-
-### ANGLE 4: LAUNCH OVERHEAD
-
-#### O14: CUDA Graphs compatibility
-- **What:** Dynamic `torch.zeros(2, ...)` allocations in `_triton_fused.py:179,210-212` prevent CUDA Graphs capture (addresses may differ across steps).
-- **Fix:** Store `norms_buf` as persistent optimizer state, allocated once during init.
-- **Complexity:** Low.
-- **Impact:** Critical for small models where kernel launch overhead dominates. Enables 2-5x speedup when combined with CUDA Graphs.
+### ANGLE 2: LAUNCH OVERHEAD
 
 #### O15: Flat-parameter batching (FusedAdam-style)
 - **What:** Flatten all params in a group into contiguous 1D buffers, single kernel over entire flat tensor. Reduces kernel launches from 2N to 2.
 - **Complexity:** Very high — requires rewriting state management, gradient accumulation, and the kernel to handle segmented operations.
 - **Impact:** 30-50% for models with many small params.
 
+#### O9 (revised): Async CPU↔GPU transfers
+- **What:** Would need double-buffering (transfer param[i+1] while computing param[i]) to actually overlap transfers with compute. Simple pin_memory + non_blocking didn't help.
+- **Complexity:** Medium — requires restructuring the per-param loop into a pipeline.
+- **Impact:** Up to 2x for cpu_offload path, but only benefits users with constrained VRAM.
+
+---
+
+## REJECTED: GradPower (grad_power parameter)
+
+**File:** `grokadamw.py` (removed)
+
+**What was tested:** A `grad_power` parameter (default 1.0) that transforms gradients via `sign(g) * |g|^p` before optimizer step. Based on gradient power normalization research.
+
+**Sweep results (p=0.5 to 1.5, Llama 36.96M, 1000 steps):**
+
+| p | loss@1000 | eval@1000 | opt_ms |
+|---|---|---|---|
+| 1.0 (baseline) | **5.03** | **5.10** | **5.1** |
+| 0.8 | 5.16 | 5.22 | 10.6 |
+| 0.5 | 5.56 | 5.61 | 10.7 |
+| 1.2 | 5.53 | 5.60 | 10.6 |
+| 1.5 | 7.84 | 7.89 | 10.7 |
+
+**Why rejected:**
+1. **Worse loss for all p≠1.0:** GrokAdamW's `grok_ema` mechanism is magnitude-sensitive — it tracks the EMA of raw gradients. GradPower's `|g|^p * sign(g)` distorts gradient magnitudes, corrupting the slow-gradient signal that grok_ema relies on.
+2. **2x slower opt_ms:** GradPower is implemented in Python (not fused into Triton), adding ~5ms overhead. `abs().pow(p)` creates temporary tensors, and `grad.float()` is called early, bypassing the optimized Triton path.
+3. **No benefit at p=1.0:** p=1.0 is identity transform, equivalent to no GradPower. All other values are strictly worse.
+
+**Verdict:** GradPower is fundamentally incompatible with GrokAdamW's grok_ema mechanism. Removed from codebase.
+
 ---
 
 ## Recommended Next Steps (Priority Order)
 
-1. **O9** (Async CPU transfers) — Low-medium complexity, 20-40% for offload users
-2. **O8** (`@triton.autotune`) — Low complexity, easy win
-3. **O2** (Eliminate fallback grok_grad_buf) — Medium complexity, 25% VRAM
-4. **O6** (Atomic contention) — Medium complexity, helps large params
-5. **O3** (bf16 states) — Medium complexity, 50% VRAM but has underflow risk
-6. **O15** (Flat-param batching) — Very high complexity, nuclear option
-7. **O4** (8-bit quant) — Very high complexity, maximum VRAM savings
+1. **O3** (bf16 states) — Medium complexity, 50% VRAM but has underflow risk
+2. **O15** (Flat-param batching) — Very high complexity, nuclear option
+3. **O4** (8-bit quant) — Very high complexity, maximum VRAM savings
+4. **O9 revised** (Double-buffered async transfers) — Medium complexity, only helps cpu_offload
+5. **O6** (Atomic contention) — May help on older GPUs, needs hardware-specific evaluation
+
+---
+
+## Final Results Summary (All Changes Combined)
+
+**Applied optimizations:** BUG FIX, O1, O2, O5, O7, O8, O10, O11, O13, O14, O16 (11 total)
+**Reverted:** O6 (atomic_add regression), O9 (pin_memory VRAM regression)
+**Blocked:** O12 (PyTorch API limitation)
+**Rejected:** GradPower (incompatible with grok_ema)
+
+### train_real.py (Llama 36.96M, bf16, 1000 steps)
+
+| Metric | Baseline (start) | Final |
+|---|---|---|
+| opt_ms (steady) | 6.0–6.9 ms | 5.0–5.3 ms |
+| total_ms | 184–194 ms | 178–180 ms |
+| VRAM | 13547 MB | 13547 MB |
+| opt GPU/CPU | 423/0 MB | 423/0 MB |
+| loss@1000 | — | 5.03 |
+
+### train_test.py (TinyTransformer 3.32M, fp32, 5000 steps)
+
+| Version | opt_ms (steady) | total_ms | VRAM | opt G/C |
+|---|---|---|---|---|
+| NEW (pre-O9) | 6.4–6.8 ms | 20.3–20.5 ms | 327 MB | 38/0 MB |
+| NEWER (current, O9 reverted) | 6.4–6.6 ms | 20.2–20.5 ms | 340 MB | 38/0 MB |
+| NEWER cpu_offload | 36.8–37.9 ms | 50.6–51.9 ms | 315 MB | 0/38 MB |
+
+**Key observations:**
+- NEW vs NEWER (no cpu_offload): Identical within GPU variance — O9 revert confirmed clean
+- cpu_offload opt_ms ~6x slower than GPU states — fundamental PCIe bandwidth limitation (~12 GB/s vs ~900 GB/s HBM)
+- cpu_offload saves ~12 MB VRAM (state tensors on CPU instead of GPU)
+- O2 saved 141 MB CPU state memory for cpu_offload path (564→423 MB for Llama 36.96M)

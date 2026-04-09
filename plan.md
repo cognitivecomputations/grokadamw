@@ -217,7 +217,7 @@ def _launch_norms(grad, grok_ema, norms_buf, alpha, lamb):
 
 ### Riskler
 - İlk çalıştırmada tuning süresi uzun (her config denenir) → warmup süresi artar
-- Derlenmiş kernel cache yoksa her进程 başında tuning tekrarlanır
+- Derlenmiş kernel cache yoksa her işlem başında tuning tekrarlanır
 - `key=["n_elements"]` ile sadece element sayısına göre tune edilir; data pattern'i etkisi yok
 
 ### Test
@@ -314,7 +314,7 @@ if cpu_offload:
 - Numerical equivalence testi kritik — sonuçlar bayt-bayt aynı olmalı
 
 ### Test
-- `test_fp32_cpu_vs_gpu_states` (meccut, atol=1e-5)
+- `test_fp32_cpu_vs_gpu_states` (mevcut, atol=1e-5)
 - `test_bf16_cpu_vs_gpu_states`
 - `test_save_load_roundtrip` — eski checkpoint ile uyumluluk
 - Benchmark: per-param norm vs batched norm performans karşılaştırması
@@ -371,7 +371,7 @@ Bu yaklaşımda aslında iki kernel kalır ama aradaki fark:
 - Phase 1 ve 2 art arda aynı param için çalışır (mevcut: tüm phase1 → tüm phase2)
 - Bu da grok_ema'nın cache'te kalma olasılığını artırır
 
-**Yaklaşım 2: Gerçektek-kernel füzyonu (Triton 3.0+ num_ctas)**
+**Yaklaşım 2: Gerçek tek-kernel füzyonu (Triton 3.0+ num_ctas)**
 ```python
 @triton.jit
 def _single_fused_kernel(

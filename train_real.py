@@ -305,10 +305,8 @@ def main():
     from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 
     all_x, all_y = preprocess_and_cache(tokenizer, cfg)
-
     criterion = LigerCrossEntropyLoss()
 
-    # --- New GrokAdamW OPTIMIZED ---
     for mod in list(sys.modules.keys()):
         if "grokadamw" in mod.lower():
             del sys.modules[mod]
@@ -316,16 +314,30 @@ def main():
     from grokadamw import GrokAdamW as NewGrokAdamW
     import grokadamw as _new_ref
 
-    print(f"\n[New GrokAdamW from: {_new_ref.__file__}]")
+    print(f"\n[GrokAdamW from: {_new_ref.__file__}]")
+
     seed_everything(42)
-    model2 = create_model(cfg)
-    apply_liger_kernel_to_instance(model2)
-    opt2 = NewGrokAdamW(
-        model2.parameters(),
+    model = create_model(cfg)
+    apply_liger_kernel_to_instance(model)
+    opt = NewGrokAdamW(
+        model.parameters(),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
-    train("GrokAdamW OPTIMIZED", model2, opt2, all_x, all_y, criterion, cfg)
+    train(
+        "GrokAdamW (GPU states)",
+        model,
+        opt,
+        all_x,
+        all_y,
+        criterion,
+        cfg,
+    )
+    del model, opt
+    torch.cuda.empty_cache()
+    import gc
+
+    gc.collect()
 
     print(f"\n{'=' * 115}")
     print("DONE")

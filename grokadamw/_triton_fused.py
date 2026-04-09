@@ -10,7 +10,22 @@ except ImportError:
 
 
 if _TRITON_AVAILABLE:
+    _AUTOTUNE_CONFIGS = [
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE": 8192}, num_warps=8, num_stages=3),
+    ]
 
+    @triton.autotune(
+        configs=_AUTOTUNE_CONFIGS,
+        key=["n_elements"],
+        reset_to_zero=["out_grad_sq_ptr", "out_grok_sq_ptr"],
+        restore_value=["grok_ema_ptr"],
+    )
     @triton.jit
     def _norms_kernel(
         grad_ptr,
@@ -39,6 +54,11 @@ if _TRITON_AVAILABLE:
         tl.atomic_add(out_grad_sq_ptr, tl.sum(g_sq))
         tl.atomic_add(out_grok_sq_ptr, tl.sum(gg_sq))
 
+    @triton.autotune(
+        configs=_AUTOTUNE_CONFIGS,
+        key=["n_elements"],
+        restore_value=["p_ptr", "exp_avg_ptr", "exp_avg_sq_ptr"],
+    )
     @triton.jit
     def _update_kernel(
         p_ptr,
@@ -87,10 +107,7 @@ if _TRITON_AVAILABLE:
         n = grad.numel()
         if n == 0:
             return
-        bs = min(4096, triton.next_power_of_2(n))
-        nw = 8 if n > 65536 else (4 if n > 4096 else 2)
-        ns = 3 if n > 16384 else 2
-        grid = ((n + bs - 1) // bs,)
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
         norms_buf.zero_()
         _norms_kernel[grid](
             grad,
@@ -100,9 +117,6 @@ if _TRITON_AVAILABLE:
             alpha,
             lamb,
             n,
-            BLOCK_SIZE=bs,
-            num_warps=nw,
-            num_stages=ns,
         )
 
     def _launch_update(
@@ -122,10 +136,7 @@ if _TRITON_AVAILABLE:
         n = p.numel()
         if n == 0:
             return
-        bs = min(4096, triton.next_power_of_2(n))
-        nw = 8 if n > 65536 else (4 if n > 4096 else 2)
-        ns = 3 if n > 16384 else 2
-        grid = ((n + bs - 1) // bs,)
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
         _update_kernel[grid](
             p,
             grad,
@@ -142,9 +153,6 @@ if _TRITON_AVAILABLE:
             eps,
             eps,
             n,
-            BLOCK_SIZE=bs,
-            num_warps=nw,
-            num_stages=ns,
         )
 
     def grokadamw_fused_step(

@@ -3,8 +3,6 @@ import torch.nn as nn
 import time
 import sys
 import os
-import importlib
-import importlib.util
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -38,26 +36,44 @@ def make_data(batch, seq_len, vocab):
     return x[:, :-1], x[:, 1:]
 
 
+def optimizer_memory(optimizer):
+    gpu_bytes = 0
+    cpu_bytes = 0
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                b = v.element_size() * v.nelement()
+                if v.is_cuda:
+                    gpu_bytes += b
+                else:
+                    cpu_bytes += b
+    return gpu_bytes / 1024**2, cpu_bytes / 1024**2
+
+
 def train(name, model, opt_fn, steps=5000, eval_every=500):
     optimizer = opt_fn(model)
     vocab = 256
     seq_len = 128
     batch = 32
 
-    print(f"\n{'=' * 90}")
+    print(f"\n{'=' * 100}")
     print(f"  {name}")
     print(f"  params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    print(f"{'=' * 90}")
+    print(f"{'=' * 100}")
     print(
         f"{'step':>6} {'train_loss':>10} {'eval_loss':>10} {'gen_gap':>8}"
         f" {'fwd_ms':>7} {'bwd_ms':>7} {'opt_ms':>7} {'total_ms':>8}"
+        f" {'VRAM_MB':>8} {'opt_G/C':>10}"
     )
-    print("-" * 90)
+    print("-" * 100)
 
     fwd_acc = 0.0
     bwd_acc = 0.0
     opt_acc = 0.0
     t0 = time.perf_counter()
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
 
     for step in range(1, steps + 1):
         model.train()
@@ -105,13 +121,20 @@ def train(name, model, opt_fn, steps=5000, eval_every=500):
             bwd_avg = bwd_acc / eval_every
             opt_avg = opt_acc / eval_every
             gap = eval_loss - loss.item()
+
+            vram_mb = torch.cuda.max_memory_allocated() / 1024**2
+            opt_gpu, opt_cpu = optimizer_memory(optimizer)
+
             print(
                 f"{step:>6} {loss.item():>10.4f} {eval_loss:>10.4f} {gap:>8.4f}"
                 f" {fwd_avg:>7.2f} {bwd_avg:>7.2f} {opt_avg:>7.2f} {total_ms:>8.1f}"
+                f" {vram_mb:>7.0f}MB {opt_gpu:>4.0f}/{opt_cpu:<4.0f}MB"
             )
             fwd_acc = 0.0
             bwd_acc = 0.0
             opt_acc = 0.0
+
+            torch.cuda.reset_peak_memory_stats()
 
     return model
 
@@ -126,43 +149,36 @@ def main():
     print(f"Steps: {steps}")
 
     torch.manual_seed(42)
-    model_old = TinyTransformer(vocab=vocab, seq_len=seq_len).to(DEVICE)
-    init_state = {k: v.clone() for k, v in model_old.state_dict().items()}
+    model = TinyTransformer(vocab=vocab, seq_len=seq_len).to(DEVICE)
+    init_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    torch.manual_seed(42)
-    model_new = TinyTransformer(vocab=vocab, seq_len=seq_len).to(DEVICE)
-    model_new.load_state_dict({k: v.clone() for k, v in init_state.items()})
+    sys.path.insert(0, os.path.dirname(__file__))
 
-    # --- Old GrokAdamW v0.1.2 (pip installed, site-packages) ---
-    site_pkg = "/root/train/.venv/lib/python3.12/site-packages"
-    old_mod_path = os.path.join(site_pkg, "grokadamw", "grokadamw.py")
-    spec = importlib.util.spec_from_file_location("grokadamw_old", old_mod_path)
-    old_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(old_module)
-    OldGrokAdamW = old_module.GrokAdamW
-    print(f"\n[Old GrokAdamW loaded from: {old_mod_path}]")
-
-    train(
-        "GrokAdamW v0.1.2 OLD (pip, site-packages)",
-        model_old,
-        lambda m: OldGrokAdamW(m.parameters(), lr=1e-3, weight_decay=1e-2),
-        steps=steps,
-    )
-
-    # --- New optimized GrokAdamW (local) ---
     for mod in list(sys.modules.keys()):
         if "grokadamw" in mod.lower():
             del sys.modules[mod]
-    sys.path.insert(0, os.path.dirname(__file__))
-    from grokadamw import GrokAdamW as NewGrokAdamW
+    from grokadamw import GrokAdamW
     import grokadamw as _gref
 
-    print(f"[New GrokAdamW loaded from: {_gref.__file__}]")
+    print(f"\n[GrokAdamW from: {_gref.__file__}]")
 
     train(
-        "GrokAdamW OPTIMIZED (local, foreach + sync-free clip)",
-        model_new,
-        lambda m: NewGrokAdamW(m.parameters(), lr=1e-3, weight_decay=1e-2),
+        "GrokAdamW (GPU states)",
+        model,
+        lambda m: GrokAdamW(m.parameters(), lr=1e-3, weight_decay=1e-2),
+        steps=steps,
+    )
+
+    torch.manual_seed(42)
+    model_offload = TinyTransformer(vocab=vocab, seq_len=seq_len).to(DEVICE)
+    model_offload.load_state_dict({k: v.clone() for k, v in init_state.items()})
+
+    train(
+        "GrokAdamW cpu_offload",
+        model_offload,
+        lambda m: GrokAdamW(
+            m.parameters(), lr=1e-3, weight_decay=1e-2, cpu_offload=True
+        ),
         steps=steps,
     )
 

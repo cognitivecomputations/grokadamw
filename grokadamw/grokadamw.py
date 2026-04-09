@@ -23,7 +23,6 @@ def _foreach_update(
     exp_avgs: list[torch.Tensor],
     exp_avg_sqs: list[torch.Tensor],
     grok_emas: list[torch.Tensor],
-    grok_grad_bufs: list[torch.Tensor],
     alpha: float,
     lamb: float,
     layer_beta1_list: list[float],
@@ -39,15 +38,13 @@ def _foreach_update(
     torch._foreach_mul_(grok_emas, alpha)
     torch._foreach_add_(grok_emas, grads, alpha=1 - alpha)
     torch._foreach_mul_(params, 1 - lr_wd)
-    torch._foreach_copy_(grok_grad_bufs, grads)
-    torch._foreach_add_(grok_grad_bufs, grok_emas, alpha=lamb)
-
-    grok_grad_norms = torch._foreach_norm(grok_grad_bufs)
-    scales = [gn / ggn.clamp(min=eps) for gn, ggn in zip(grad_norms, grok_grad_norms)]
-    torch._foreach_mul_(grok_grad_bufs, scales)
 
     for i in range(n):
-        grok_grad = grok_grad_bufs[i]
+        grok_grad = grads[i] + lamb * grok_emas[i]
+        grok_grad_norm = grok_grad.norm()
+        scale = grad_norms[i] / grok_grad_norm.clamp(min=eps)
+        grok_grad = grok_grad * scale
+
         exp_avgs[i].mul_(layer_beta1_list[i]).add_(
             grok_grad, alpha=1 - layer_beta1_list[i]
         )
@@ -171,7 +168,6 @@ class GrokAdamW(Optimizer):
         active_exp_avg = []
         active_exp_avg_sq = []
         active_grok_ema = []
-        active_grok_grad_buf = []
         layer_beta1_list = []
         step_size_list = []
 
@@ -263,22 +259,11 @@ class GrokAdamW(Optimizer):
             else:
                 grad = grad.float()
 
-            if "grok_grad_buf" not in state:
-                state["grok_grad_buf"] = torch.zeros(
-                    p.shape,
-                    dtype=torch.float32,
-                    device="cpu" if cpu_offload else p.device,
-                )
-            grok_grad_buf = state["grok_grad_buf"]
-            if cpu_offload:
-                grok_grad_buf = grok_grad_buf.to(p.device)
-
             active_params.append(p)
             active_grads.append(grad)
             active_exp_avg.append(exp_avg)
             active_exp_avg_sq.append(exp_avg_sq)
             active_grok_ema.append(grok_ema)
-            active_grok_grad_buf.append(grok_grad_buf)
             layer_beta1_list.append(layer_beta1)
             step_size_list.append(step_size)
 
@@ -300,7 +285,6 @@ class GrokAdamW(Optimizer):
             active_exp_avg,
             active_exp_avg_sq,
             active_grok_ema,
-            active_grok_grad_buf,
             alpha,
             group["lamb"],
             layer_beta1_list,
@@ -311,25 +295,22 @@ class GrokAdamW(Optimizer):
         )
 
         if cpu_offload:
-            for p, exp_avg, exp_avg_sq, grok_ema, grok_grad_buf in zip(
+            for p, exp_avg, exp_avg_sq, grok_ema in zip(
                 active_params,
                 active_exp_avg,
                 active_exp_avg_sq,
                 active_grok_ema,
-                active_grok_grad_buf,
             ):
                 state = self.state[p]
                 state["exp_avg"] = exp_avg.to("cpu")
                 state["exp_avg_sq"] = exp_avg_sq.to("cpu")
                 state["grok_ema"] = grok_ema.to("cpu")
-                state["grok_grad_buf"] = grok_grad_buf.to("cpu")
 
     def state_dict(self):
         state_dict = super().state_dict()
         for group in state_dict["param_groups"]:
             group["grokking_signal_fns"] = None
         for param_id, state in state_dict.get("state", {}).items():
-            state.pop("grok_grad_buf", None)
             state.pop("norms_buf", None)
             state.pop("grad_fp32_buf", None)
         return state_dict
@@ -344,7 +325,7 @@ class GrokAdamW(Optimizer):
             for p in group["params"]:
                 state = self.state.get(p, {})
                 if state:
-                    for key in ("exp_avg", "exp_avg_sq", "grok_ema", "grok_grad_buf"):
+                    for key in ("exp_avg", "exp_avg_sq", "grok_ema"):
                         if key in state and isinstance(state[key], torch.Tensor):
                             state[key] = state[key].to(dtype=torch.float32)
                             if target_device is not None:
