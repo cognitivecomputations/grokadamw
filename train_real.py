@@ -19,6 +19,7 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
     torch.use_deterministic_algorithms(True)
 
@@ -126,18 +127,15 @@ def preprocess_and_cache(tokenizer, cfg):
 
 
 @torch.no_grad()
-def evaluate(model, all_x, all_y, criterion, n_batches=10, batch_size=16):
-    model.eval()
+def evaluate(model, all_x, all_y, n_batches=10, batch_size=16):
     losses = []
     indices = torch.randperm(all_x.shape[0])[: n_batches * batch_size]
     for i in range(0, len(indices), batch_size):
         idx = indices[i : i + batch_size]
         x = all_x[idx].to(DEVICE)
         y = all_y[idx].to(DEVICE)
-        logits = model(x).logits
-        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
-        losses.append(loss.item())
-    model.train()
+        output = model(x, labels=y)
+        losses.append(output.loss.item())
     return sum(losses) / len(losses) if losses else float("inf")
 
 
@@ -169,7 +167,7 @@ def estimate_tflops(n_params, seq_len, batch_size, ms_per_step):
     return tflops
 
 
-def train(name, model, optimizer, all_x, all_y, criterion, cfg: TrainConfig):
+def train(name, model, optimizer, all_x, all_y, cfg: TrainConfig):
     model.train()
 
     n_params, n_trainable = count_params(model)
@@ -218,8 +216,8 @@ def train(name, model, optimizer, all_x, all_y, criterion, cfg: TrainConfig):
 
         torch.cuda.synchronize()
         tf = time.perf_counter()
-        logits = model(batch_x).logits
-        loss = criterion(logits.view(-1, logits.size(-1)), batch_y.view(-1))
+        output = model(batch_x, labels=batch_y)
+        loss = output.loss
         torch.cuda.synchronize()
         fwd_acc += (time.perf_counter() - tf) * 1000
 
@@ -262,9 +260,7 @@ def train(name, model, optimizer, all_x, all_y, criterion, cfg: TrainConfig):
             fwd_acc = bwd_acc = opt_acc = data_acc = 0.0
             tokens_acc = 0
 
-            eval_loss = evaluate(
-                model, all_x, all_y, criterion, n_batches=10, batch_size=16
-            )
+            eval_loss = evaluate(model, all_x, all_y, n_batches=10, batch_size=16)
 
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
@@ -299,13 +295,9 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     cfg.vocab_size = tokenizer.vocab_size
 
-    from liger_kernel.transformers.monkey_patch import (
-        _apply_liger_kernel_to_instance as apply_liger_kernel_to_instance,
-    )
-    from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+    from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_llama
 
     all_x, all_y = preprocess_and_cache(tokenizer, cfg)
-    criterion = LigerCrossEntropyLoss()
 
     for mod in list(sys.modules.keys()):
         if "grokadamw" in mod.lower():
@@ -317,20 +309,19 @@ def main():
     print(f"\n[GrokAdamW from: {_new_ref.__file__}]")
 
     seed_everything(42)
+    apply_liger_kernel_to_llama()
     model = create_model(cfg)
-    apply_liger_kernel_to_instance(model)
     opt = NewGrokAdamW(
         model.parameters(),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
     train(
-        "GrokAdamW (GPU states)",
+        "GrokAdamW",
         model,
         opt,
         all_x,
         all_y,
-        criterion,
         cfg,
     )
     del model, opt
